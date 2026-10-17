@@ -143,7 +143,7 @@ class CsvData:
         st = np.concatenate(parts)
         if st[-1] >= self.size:
             st = st[:-1]
-        self.st = np.append(st, self.size)          # line i = mm[st[i]:st[i+1]]
+        self.st = self.join_multiline(np.append(st, self.size))   # record i = mm[st[i]:st[i+1]]
         self.n = len(self.st) - 2                   # data rows (minus header)
         h = self.line(0)
         self.d = max(',;\t|', key=h.count)
@@ -156,6 +156,62 @@ class CsvData:
         self.dcols, self.corder = set(), list(range(len(self.cols)))   # deleted columns / file column order
         self.cols_dirty = self.struct = False
         self.nc0 = len(self.cols)                   # columns that exist on disk
+
+    def join_multiline(self, st):
+        """Merge physical lines that belong to one record (a quoted field containing line breaks).
+        Vectorised: only lines with an ODD number of quotes can open/close a quoted field, so the
+        Python-level work is limited to those (none at all for most files)."""
+        mm, size = self.mm, self.size
+        if mm.find(b'"') < 0:
+            return st
+        nl = len(st) - 1
+        qc = np.zeros(nl, np.int64)
+        CH = 1 << 26
+        for b in range(0, size, CH):
+            a = np.frombuffer(mm, np.uint8, min(CH, size - b), b)
+            q = np.flatnonzero(a == 34) + b
+            del a
+            if len(q):
+                li = np.searchsorted(st, q, side='right') - 1
+                lo = int(li[0])
+                qc[lo:int(li[-1]) + 1] += np.bincount(li - lo)
+        odd = np.flatnonzero(qc & 1).tolist()
+        if not odd:
+            return st
+        d = ord(self.d_guess())
+        keep, k = np.ones(len(st), bool), 0
+        while k < len(odd):
+            i = odd[k]
+            line = mm[st[i]:st[i + 1]]
+            if self._opens(line, d) and k + 1 < len(odd):    # quote opened and not closed on this line ->
+                j = odd[k + 1]                                # the next odd line closes it
+                keep[i + 1:j + 1] = False
+                k += 2
+            else:                                             # stray quote (e.g. inside an unquoted url)
+                k += 1
+        return st[keep]
+
+    def d_guess(self):
+        h = self.mm[:4096].decode('utf-8', 'replace')
+        return max(',;\t|', key=h.count)
+
+    @staticmethod
+    def _opens(line, d):
+        """True if scanning this line (starting outside quotes) ends inside an open quoted field.
+        A quote only opens a field at a field start, so `foo"bar` is just text."""
+        inq, prev, i, n = False, 10, 0, len(line)
+        while i < n:
+            ch = line[i]
+            if inq:
+                if ch == 34:
+                    if i + 1 < n and line[i + 1] == 34:
+                        i += 1
+                    else:
+                        inq = False
+            elif ch == 34 and (prev == d or prev == 10):
+                inq = True
+            prev = ch; i += 1
+        return inq
 
     def close(self):
         self.mm.close(); self.f.close()
@@ -365,7 +421,8 @@ class Model(C.QAbstractTableModel):
 
     def headerData(s, sec, o, role=C.Qt.DisplayRole):
         if o == C.Qt.Horizontal and role == C.Qt.DisplayRole:
-            return '#' if sec == 0 else s.d.cols[sec - 1].upper()
+            # return '#' if sec == 0 else s.d.cols[sec - 1].upper().replace('\r', '')
+            return '#' if sec == 0 else s.d.cols[sec - 1].replace('\r', '')
 
     def flags(s, ix): return F_RW if ix.column() > 0 else F_RO
 
@@ -618,11 +675,80 @@ class Model(C.QAbstractTableModel):
         s.shape.emit()
 
 
+class MultiEdit(W.QPlainTextEdit):
+    """Cell / column-name editor: Enter = done, Ctrl+Enter or Shift+Enter = line break.
+    Grows downward with its lines (only exists while a cell is being edited -> no cost on the grid)."""
+    MAXL = 12
+
+    def __init__(s, parent=None, fit_parent=True):
+        super().__init__(parent)
+        s.setLineWrapMode(W.QPlainTextEdit.NoWrap)
+        s.setHorizontalScrollBarPolicy(C.Qt.ScrollBarAlwaysOff)
+        s.setTabChangesFocus(True)
+        s.rect_, s.fit_parent = None, fit_parent
+        if fit_parent:
+            s.textChanged.connect(s.fit)
+
+    def keyPressEvent(s, e):
+        if e.key() in (C.Qt.Key_Return, C.Qt.Key_Enter) and e.modifiers() & (C.Qt.ShiftModifier | C.Qt.ControlModifier):
+            s.insertPlainText('\n'); e.accept(); return
+        super().keyPressEvent(e)
+
+    def insertFromMimeData(s, src):                  # paste: normalise \r\n, keep real line breaks
+        if src.hasText():
+            s.insertPlainText(src.text().replace('\r\n', '\n').replace('\r', '\n'))
+        else:
+            super().insertFromMimeData(src)
+
+    def place(s, rect):
+        s.rect_ = C.QRect(rect); s.fit()
+
+    def fit(s):
+        r = s.rect_
+        if r is None or not s.fit_parent:
+            return
+        n = min(max(s.document().blockCount(), 1), s.MAXL)
+        h = max(r.height(), n * s.fontMetrics().lineSpacing() + 14)
+        vp = s.parentWidget().height() if s.parentWidget() else h
+        y = r.top() if r.top() + h <= vp else max(0, vp - h)
+        s.setVerticalScrollBarPolicy(C.Qt.ScrollBarAlwaysOff if s.document().blockCount() <= s.MAXL else C.Qt.ScrollBarAsNeeded)
+        s.setGeometry(r.left(), y, max(r.width(), 200), h)
+
+
+def ask_text(parent, title, label, text=''):
+    """Multi-line replacement for QInputDialog.getText: Enter = OK, Ctrl/Shift+Enter = line break."""
+    dlg = W.QDialog(parent); dlg.setWindowTitle(title)
+    lay = W.QVBoxLayout(dlg); lay.addWidget(W.QLabel(label))
+    ed = MultiEdit(fit_parent=False)
+    ed.setPlainText(text); ed.selectAll(); ed.setFixedHeight(96); ed.setMinimumWidth(360)
+    ed.setObjectName('nameedit')
+    ed.setStyleSheet(Template('QPlainTextEdit#nameedit { background: $field; border: 1px solid $line; border-radius: 7px; '
+                              'padding: 3px 6px; color: $text; } QPlainTextEdit#nameedit:focus { border: 1px solid #3B82F6; '
+                              'background: $bg; }').substitute(CUR))
+    ed.setVerticalScrollBarPolicy(C.Qt.ScrollBarAsNeeded)
+    ed.setStyleSheet('QPlainTextEdit { background: %s; border: 1px solid %s; border-radius: 7px; padding: 3px 6px; color: %s; }'
+                     'QPlainTextEdit:focus { border: 1px solid #3B82F6; background: %s; }'
+                     % (CUR['field'], CUR['line'], CUR['text'], CUR['bg']))
+    lay.addWidget(ed)
+    bb = W.QDialogButtonBox(W.QDialogButtonBox.Ok | W.QDialogButtonBox.Cancel)
+    bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject); lay.addWidget(bb)
+    class F(C.QObject):
+        def eventFilter(f, o, ev):
+            if ev.type() == C.QEvent.KeyPress and ev.key() in (C.Qt.Key_Return, C.Qt.Key_Enter) \
+                    and not ev.modifiers() & (C.Qt.ShiftModifier | C.Qt.ControlModifier):
+                dlg.accept(); return True
+            return False
+    flt = F(dlg); ed.installEventFilter(flt)
+    ok = dlg.exec() == W.QDialog.Accepted
+    return ed.toPlainText(), ok
+
+
 class Delegate(W.QStyledItemDelegate):
     """Paints a cell with the minimum of work. Text widths and laid-out text (QStaticText) are
     cached, so scrolling back/forth and dragging a column edge re-use them instead of re-shaping
     every string on every repaint."""
     SEL = G.QPen(G.QColor('#3B82F6'), 2)
+    MAXL = 10                 # most text lines a row grows to show
 
     def __init__(s, view, model):
         super().__init__(view)
@@ -649,10 +775,28 @@ class Delegate(W.QStyledItemDelegate):
             c.clear()
 
     def createEditor(s, parent, opt, ix):
-        e = super().createEditor(parent, opt, ix)
+        e = MultiEdit(parent)
         e.setStyleSheet('border: 2px solid #3B82F6; background: %s; color: %s; padding: 0 4px;'
                         % (CUR['bg'], CUR['text']))
         return e
+
+    def setEditorData(s, e, ix):
+        e.setPlainText(ix.data(C.Qt.EditRole) or '')
+        e.selectAll()
+
+    def setModelData(s, e, model, ix):
+        model.setData(ix, e.toPlainText(), C.Qt.EditRole)
+
+    def updateEditorGeometry(s, e, opt, ix):
+        e.place(opt.rect)
+
+    def eventFilter(s, o, ev):
+        # Enter commits (like before); Ctrl/Shift+Enter is handled by MultiEdit itself (new line)
+        if isinstance(o, MultiEdit) and ev.type() == C.QEvent.KeyPress and ev.key() in (C.Qt.Key_Return, C.Qt.Key_Enter) \
+                and not ev.modifiers() & (C.Qt.ShiftModifier | C.Qt.ControlModifier):
+            s.commitData.emit(o); s.closeEditor.emit(o, W.QAbstractItemDelegate.NoHint)
+            return True
+        return super().eventFilter(o, ev)
 
     def paint(s, p, opt, ix):
         m, c, rect = s.m, ix.column(), opt.rect
@@ -692,28 +836,36 @@ class Delegate(W.QStyledItemDelegate):
             w = rect.width() - 14
             if w > 0:
                 b = 1 if bold else 0
-                text = text[:200]
-                advc = s.adv[b]
-                adv = advc.get(text)
-                if adv is None:
-                    if len(advc) > 30000:
-                        advc.clear()
-                    adv = advc[text] = (s.fmb if bold else s.fm).horizontalAdvance(text)
-                cache = s.stc[b]
-                key = text if adv <= w else (text, w)
-                st = cache.get(key)
-                if st is None:
-                    if len(cache) > 8000:
-                        cache.clear()
-                    shown = text if adv <= w else (s.fmb if bold else s.fm).elidedText(text[:w // 3 + 2], ELIDE, w)
-                    st = G.QStaticText(shown)
-                    st.setTextFormat(PLAIN)
-                    st.setPerformanceHint(G.QStaticText.AggressiveCaching)
-                    st.prepare(s.ident, s.fb if bold else s.fn)
-                    cache[key] = st
-                p.setFont(s.fb if bold else s.fn)
-                p.setPen(pen)
-                p.drawStaticText(rect.left() + 8, rect.top() + (rect.height() - s.lh) // 2, st)
+                fnt = s.fb if bold else s.fn
+                fmx = s.fmb if bold else s.fm
+                if '\n' in text or '\r' in text:           # multi-line cell: one line per row of text
+                    lines = text[:4000].replace('\r', '').split('\n')[:s.MAXL]
+                else:
+                    lines = (text[:200],)
+                p.setFont(fnt); p.setPen(pen)
+                y = rect.top() + (ROW_H - s.lh) // 2
+                advc, cache = s.adv[b], s.stc[b]
+                for text in lines:
+                    if text:
+                        text = text[:200]
+                        adv = advc.get(text)
+                        if adv is None:
+                            if len(advc) > 30000:
+                                advc.clear()
+                            adv = advc[text] = fmx.horizontalAdvance(text)
+                        key = text if adv <= w else (text, w)
+                        st = cache.get(key)
+                        if st is None:
+                            if len(cache) > 8000:
+                                cache.clear()
+                            shown = text if adv <= w else fmx.elidedText(text[:w // 3 + 2], ELIDE, w)
+                            st = G.QStaticText(shown)
+                            st.setTextFormat(PLAIN)
+                            st.setPerformanceHint(G.QStaticText.AggressiveCaching)
+                            st.prepare(s.ident, fnt)
+                            cache[key] = st
+                        p.drawStaticText(rect.left() + 8, y, st)
+                    y += s.lh
 
         if opt.state & SELECTED:
             p.setPen(s.SEL)
@@ -765,6 +917,14 @@ class Tab(W.QTableView):
             for r in range(min(100, s.data_.n)):
                 w = max(w, fm.horizontalAdvance(s.data_.field(r, c)[:80]) + 22)
             s.setColumnWidth(c + 1, max(60, min(w, 420)))
+        s._fp = False                                    # multi-line: rows grow only when they hold line breaks
+        sb = s.verticalScrollBar()
+        sb.valueChanged.connect(s.sched)
+        for sig in (s.m.modelReset, s.m.layoutChanged, s.m.dataChanged, s.m.rowsInserted, s.m.rowsRemoved):
+            sig.connect(s.sched)
+        for sig in (s.m.headerDataChanged, s.m.columnsInserted, s.m.edited):
+            sig.connect(s.fit_header)
+        s.fit_header(); s.sched()
         s.customContextMenuRequested.connect(s.menu)
         hh.setContextMenuPolicy(C.Qt.CustomContextMenu); hh.customContextMenuRequested.connect(s.hmenu)
         hh.sectionDoubleClicked.connect(lambda i: i and s.rename_col(i - 1))
@@ -773,6 +933,52 @@ class Tab(W.QTableView):
         s._anim.valueChanged.connect(lambda v: s.verticalScrollBar().setValue(int(v)))
         s._target = 0
         s.restyle()
+
+    def resizeEvent(s, e):
+        super().resizeEvent(e); s.sched()
+
+    def sched(s, *_):
+        if not s._fp:
+            s._fp = True; C.QTimer.singleShot(0, s.fit_rows)
+
+    def fit_header(s, *_):
+        d, n = s.data_, 1
+        for c, name in enumerate(d.cols):
+            if '\n' in name and c not in d.dcols:
+                n = max(n, name.count('\n') + 1)
+        f = G.QFont(s.horizontalHeader().font()); f.setPixelSize(16); f.setWeight(G.QFont.DemiBold)
+        s.horizontalHeader().setFixedHeight(max(30, n * G.QFontMetrics(f).lineSpacing() + 10))
+
+    def fit_rows(s):
+        """Rows are fixed height, except rows holding a line break: only the VISIBLE rows are checked
+        (a byte search on the raw line), so cost does not depend on file size."""
+        s._fp = False
+        m, d, dl = s.m, s.data_, s.itemDelegate()
+        n = m.rowCount()
+        if not n:
+            return
+        ed = {k[0] for k in d.edits} if d.edits else ()
+        ncol, lh, changed = len(d.cols), dl.lh, False
+        r = max(s.rowAt(0), 0)
+        y, H = s.rowViewportPosition(r), s.viewport().height()
+        while r < n and y < H:
+            rid = m.src(r)
+            lines = 1
+            if rid >= d.ns or rid in ed:
+                for c in range(ncol):
+                    v = d.field(rid, c)
+                    if '\n' in v:
+                        lines = max(lines, v.count('\n') + 1)
+            elif b'\n' in d.raw(rid + 1).rstrip(b'\r\n'):
+                for v in d.row(rid):
+                    if '\n' in v:
+                        lines = max(lines, v.count('\n') + 1)
+            h = ROW_H + (min(lines, dl.MAXL) - 1) * lh
+            if s.rowHeight(r) != h:
+                s.setRowHeight(r, h); changed = True
+            y += h; r += 1
+        if changed:
+            s.viewport().update(); s.sched()
 
     def wheelEvent(s, e):
         sb = s.verticalScrollBar()
@@ -896,7 +1102,7 @@ class Tab(W.QTableView):
         if ref is None:                                   # toolbar: right of the current column
             c = s.currentIndex().column() - 1
             ref = c if c >= 0 else None
-        name, ok = W.QInputDialog.getText(s, 'ReconSheet', 'New column name:')
+        name, ok = ask_text(s, 'ReconSheet', 'New column name:')
         name = name.strip()
         if not ok or not name:
             return
@@ -910,7 +1116,7 @@ class Tab(W.QTableView):
             s.selectionModel().setCurrentIndex(ix, C.QItemSelectionModel.NoUpdate); s.scrollTo(ix)
 
     def rename_col(s, c):
-        name, ok = W.QInputDialog.getText(s, 'ReconSheet', 'Column name:', text=s.data_.cols[c])
+        name, ok = ask_text(s, 'ReconSheet', 'Column name:', s.data_.cols[c])
         if ok and name.strip() and name.strip() != s.data_.cols[c]:
             s.m.rename_col(c, name.strip())
 
@@ -1030,6 +1236,7 @@ class Tab(W.QTableView):
     def refont(s):
         """The app font changed: re-read it for the painted cells (the delegate caches its fonts)."""
         s.itemDelegate().refont(s.font())
+        s.sched()
         s.horizontalHeader().setFont(s.font())        # column names (the header has its own stylesheet)
         s.viewport().update()
 
